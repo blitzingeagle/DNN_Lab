@@ -3,6 +3,8 @@ import argparse
 import cv2
 import numpy as np
 import os
+import sys
+from glob import glob
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,41 +33,63 @@ class Net(nn.Module):
         return x
 
 
-def load_data(filename):
-    loader = []
-    dirname = os.path.dirname(filename)
+def cv2_to_pytorch(img):
+    data = img[:, :, ::-1]
+    data = np.swapaxes(np.swapaxes(np.array(data, dtype=float), 0, 2), 1, 2) / 255.
+    data_shape = (1,) + data.shape
+    data = torch.from_numpy(data.reshape(data_shape)).float()
 
-    with open(filename, "r") as f:
+    return data
+
+
+def data_from_filepath(filepath, img_shape=(32, 32)):
+    data = cv2.resize(cv2.imread(filepath), img_shape)
+    data = cv2_to_pytorch(data)
+
+    return data
+
+
+def load_data(dataroot, img_shape=(32, 32), labeled=True):
+    labels_filepath = os.path.join(dataroot, "labels.txt")
+
+    loader = []
+
+    with open(labels_filepath, "r") as f:
         contents = f.readlines()
         for line in contents:
             line = line.strip().split()
-            print(line)
 
-            (data, target) = (None, None)
+            if labeled:
+                (filename, label) = (line[0], line[1])
+                filepath = os.path.join(dataroot, filename)
 
-            if len(line) >= 1:
-                data = cv2.resize(cv2.imread(os.path.join(dirname, line[0])), (32, 32))
-                data = data[:, :, ::-1]
-                data = np.swapaxes(np.swapaxes(np.array(data, dtype=float), 0, 2), 1, 2) / 255.0
-                data_shape = (1,) + data.shape
-                data = torch.from_numpy(data.reshape(data_shape)).float()
-
-            if len(line) == 2:
-                target = torch.tensor([[float(line[1])]])
-
-            loader.append((data, target))
+                data = data_from_filepath(filepath, img_shape=img_shape)
+                target = torch.tensor([[float(label)]])
+                loader.append((data, target))
+            else:
+                filepath = os.path.join(dataroot, line[0])
+                data = cv2.resize(cv2.imread(filepath), img_shape)
+                data = cv2_to_pytorch(data)
+                loader.append(data)
 
     return loader
 
 
 def train(args, model, device, optimizer, criterion, train_loader):
     model.train()
-    module_path = os.path.join("modules", args.name)
 
-    with open(os.path.join(module_path, "train.log"), "w") as log:
+    model_path = os.path.join("models", args.name)
+    checkpoints_path = os.path.join(model_path, "checkpoints")
+    log_filepath = os.path.join(model_path, "log.txt")
+    weights_filepath = os.path.join(model_path, "weights.pth")
+
+    os.makedirs(model_path, exist_ok=True)
+    os.makedirs(checkpoints_path, exist_ok=True)
+
+    with open(log_filepath, "w") as log:
         for epoch in range(1, args.epochs + 1):
-            for batch_idx, (data, target) in enumerate(train_loader, 1):
-                data, target = data.to(device), target.to(device)
+            for (batch_idx, (data, target)) in enumerate(train_loader, 1):
+                (data, target) = (data.to(device), target.to(device))
                 optimizer.zero_grad()
                 output = model(data)
                 loss = criterion(output, target)
@@ -81,32 +105,27 @@ def train(args, model, device, optimizer, criterion, train_loader):
                     ))
 
             if epoch % args.save_interval == 0:
-                torch.save(model.state_dict(), os.path.join(module_path, "checkpoints", "save_%06d.pth" % epoch))
+                torch.save(model.state_dict(), os.path.join(checkpoints_path, "save_%06d.pth" % epoch))
 
-        torch.save(model.state_dict(), os.path.join(module_path, "weights.pth"))
+        torch.save(model.state_dict(), weights_filepath)
 
 
-def test(args, model, device, test_loader):
+def test(args, model, device, test_list):
     model.eval()
 
-    with open("results/labels.txt", "w") as lol:
-        for (data, target) in test_loader:
-            data = data.to(device)
+    results_path = os.path.join("results", args.name, os.path.basename(args.dataroot))
+    label_filepath = os.path.join(results_path, "labels.txt")
+
+    os.makedirs(results_path, exist_ok=True)
+
+    with open(label_filepath, "w") as labels:
+        for filepath in test_list:
+            data = data_from_filepath(filepath).to(device)
 
             output = model(data)
             predict = output.cpu().detach().numpy()[0][0]
 
-            print(predict)
-            lol.write("%f\n" % predict)
-
-            # img = data.cpu().detach().numpy()
-            # img = img.reshape(img.shape[1:])
-            # img = np.swapaxes(np.swapaxes(np.array(img, dtype=float), 0, 2), 0, 1)
-            # img = img[:, :, ::-1]
-            # cv2.imshow("img", img)
-            # cv2.waitKey()
-
-        # cv2.destroyAllWindows()
+            labels.write("%s %.06f\n" % (filepath, predict))
 
 
 def main():
@@ -154,10 +173,12 @@ def main():
     args = parser.parse_args()
     print(args)
 
-    if not hasattr(args, "which"):  # User has not selected command
+    # User has not selected command
+    if not hasattr(args, "which"):
         parser.print_usage()
         return
 
+    # Train
     if args.which is "train":
         # Ensure existence of args.dataroot
         if not args.dataroot:
@@ -165,17 +186,29 @@ def main():
                 args.dataroot = os.path.join("datasets", args.dataset)
             else:
                 train_parser.print_help()
+                print("Error: No dataroot specified. Use --dataset or --dataroot to specify dataroot.", file=sys.stderr)
                 return
-        if not args.name:
-            train_parser.print_help()
+        if not os.path.exists(args.dataroot):
+            print("Error: The dataroot %s could not be found." % args.dataroot)
             return
 
+        # Ensure that name has been specified
+        if not args.name:
+            train_parser.print_help()
+            print("Error: No name specified. Use --name to specify name.", file=sys.stderr)
+            return
+
+        # Use cuda if user has not disabled it and is available
         use_cuda = not args.no_cuda and torch.cuda.is_available()
         device = torch.device("cuda" if use_cuda else "cpu")
+
         torch.manual_seed(args.seed)
 
-        labels_file = os.path.join(args.dataroot, "train", "labels.txt")
-        train_loader = load_data(labels_file)
+        dataset_train_path = os.path.join(args.dataroot, "train")
+        if not os.path.exists(dataset_train_path):
+            dataset_train_path = args.dataroot
+
+        train_loader = load_data(dataset_train_path)
 
         model = Net().to(device)
         criterion = F.mse_loss
@@ -188,24 +221,39 @@ def main():
             if args.dataset:
                 args.dataroot = os.path.join("datasets", args.dataset)
             else:
-                test_parser.print_help()
+                train_parser.print_help()
+                print("Error: No dataroot specified. Use --dataset or --dataroot to specify dataroot.", file=sys.stderr)
                 return
-        if not args.name:
-            test_parser.print_help()
+        if not os.path.exists(args.dataroot):
+            print("Error: The dataroot %s could not be found." % args.dataroot)
             return
 
+        # Ensure that name has been specified
+        if not args.name:
+            train_parser.print_help()
+            print("Error: No name specified. Use --name to specify name.", file=sys.stderr)
+            return
+
+        # Use cuda if user has not disabled it and is available
         use_cuda = not args.no_cuda and torch.cuda.is_available()
         device = torch.device("cuda" if use_cuda else "cpu")
+
         torch.manual_seed(args.seed)
 
-        images_file = os.path.join(args.dataroot, "test", "filelist.txt")
-        test_loader = load_data(images_file)
+        dataset_test_path = os.path.join(args.dataroot, "test")
+        if not os.path.exists(dataset_test_path):
+            dataset_test_path = args.dataroot
+
+        test_list = sorted(glob(os.path.join(dataset_test_path, "*")))
+
+        model_path = os.path.join("models", args.name)
+        weights_filepath = os.path.join(model_path, "weights.pth")
 
         model = Net().to(device)
-        weights = torch.load(os.path.join("modules", args.name, "weights.pth"))
+        weights = torch.load(weights_filepath)
         model.load_state_dict(weights)
 
-        test(args, model, device, test_loader)
+        test(args, model, device, test_list)
 
 
 if __name__ == "__main__":
